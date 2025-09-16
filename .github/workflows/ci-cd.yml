@@ -2,15 +2,14 @@
 
 on:
   push:
-    branches: [ dev, test, main ]   # <- use main (NOT master)
+    branches: [ dev, test, main ]
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # Attach to the right GitHub Environment so env-scoped secrets are available
-    # main -> prod, dev -> dev, test -> test
+    # Branch → environment: main→prod, dev→dev, test→test
     environment:
       name: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
 
@@ -29,12 +28,12 @@ jobs:
 
       - name: Set common env from repo/env secrets
         run: |
-          echo "AZ_RG=${{ secrets.AZURE_RESOURCE_GROUP }}"       >> $GITHUB_ENV
-          echo "CAE=${{ secrets.CONTAINERAPPS_ENVIRONMENT }}"    >> $GITHUB_ENV
-          echo "KV=${{ secrets.KEYVAULT_NAME }}"                 >> $GITHUB_ENV
-          echo "SUB=${{ secrets.AZURE_SUBSCRIPTION_ID }}"        >> $GITHUB_ENV
-          echo "TENANT=${{ secrets.AZURE_TENANT_ID }}"           >> $GITHUB_ENV
-          echo "ACR=${{ secrets.ACR_NAME }}"                     >> $GITHUB_ENV
+          echo "AZ_RG=${{ secrets.AZURE_RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CAE=${{ secrets.CONTAINERAPPS_ENVIRONMENT }}" >> $GITHUB_ENV
+          echo "KV=${{ secrets.KEYVAULT_NAME }}" >> $GITHUB_ENV
+          echo "SUB=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "TENANT=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ACR=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
 
       - name: Ensure subscription
         uses: azure/cli@v2
@@ -62,13 +61,22 @@ jobs:
           tags: ${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}
 
       - name: Read OPENAI key from Key Vault
-        id: kv
         uses: azure/cli@v2
         with:
           inlineScript: |
             key=$(az keyvault secret show --vault-name "$KV" --name "OPENAI-API-KEY" --query value -o tsv)
             if [ -z "$key" ]; then echo "Missing OPENAI-API-KEY in $KV" && exit 1; fi
             echo "OPENAI_KEY=$key" >> $GITHUB_ENV
+
+      - name: (Optional) Enable ACR admin & fetch creds for first-time create
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az acr update -n "$ACR" --admin-enabled true
+            user=$(az acr credential show -n "$ACR" --query "username" -o tsv)
+            pass=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
+            echo "ACR_USER=$user" >> $GITHUB_ENV
+            echo "ACR_PASS=$pass" >> $GITHUB_ENV
 
       - name: Create/Update Container App
         uses: azure/cli@v2
@@ -77,7 +85,7 @@ jobs:
             APPNAME="app-cicdlearn-${{ env.ENVNAME }}"
             IMG="${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}"
 
-            # Create if missing (idempotent)
+            # Create if missing (pass registry creds only on create)
             az containerapp create \
               -g "$AZ_RG" \
               -n "$APPNAME" \
@@ -85,6 +93,8 @@ jobs:
               --image "$IMG" \
               --ingress external --target-port 8080 \
               --registry-server "${{ env.ACR }}.azurecr.io" \
+              --registry-username "$ACR_USER" \
+              --registry-password "$ACR_PASS" \
               --query name -o tsv || true
 
             # Update image & env
