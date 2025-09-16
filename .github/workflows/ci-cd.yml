@@ -124,23 +124,23 @@ jobs:
           push: true
           tags: ${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}
 
-      - name: Read OPENAI key from Key Vault
-        uses: azure/cli@v2
-        with:
-          inlineScript: |
-            set -e
-            echo "Reading OPENAI-API-KEY from $KV ..."
-            key=$(az keyvault secret show --vault-name "$KV" --name "OPENAI-API-KEY" --query value -o tsv 2>/tmp/kv.err || true)
-            if [ -z "$key" ]; then
-              echo "::error::Failed to read OPENAI-API-KEY from $KV"
-              echo "Diagnostic:"
-              cat /tmp/kv.err || true
-              echo "Quick fixes:"
-              echo "  • Ensure the secret exists: az keyvault secret set --vault-name $KV -n OPENAI-API-KEY --value <value>"
-              echo "  • Ensure the runner SP (clientId $(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.clientId')) can read secrets (RBAC: 'Key Vault Secrets User' or Access Policy Get/List)."
-              exit 1
-            fi
-            echo "OPENAI_KEY=$key" >> $GITHUB_ENV
+      #- name: Read OPENAI key from Key Vault
+      #  uses: azure/cli@v2
+      #  with:
+      #    inlineScript: |
+      #      set -e
+      #      echo "Reading OPENAI-API-KEY from $KV ..."
+      #      key=$(az keyvault secret show --vault-name "$KV" --name "OPENAI-API-KEY" --query value -o tsv 2>/tmp/kv.err || true)
+      #      if [ -z "$key" ]; then
+      #        echo "::error::Failed to read OPENAI-API-KEY from $KV"
+      #        echo "Diagnostic:"
+      #        cat /tmp/kv.err || true
+      #        echo "Quick fixes:"
+      #        echo "  • Ensure the secret exists: az keyvault secret set --vault-name $KV -n OPENAI-API-KEY --value <value>"
+      #        echo "  • Ensure the runner SP (clientId $(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.clientId')) can read secrets (RBAC: 'Key Vault Secrets User' or Access Policy Get/List)."
+      #        exit 1
+      #      fi
+      #      echo "OPENAI_KEY=$key" >> $GITHUB_ENV
 
       - name: (Optional) Enable ACR admin & fetch creds for first-time create
         uses: azure/cli@v2
