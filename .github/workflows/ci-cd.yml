@@ -1,0 +1,184 @@
+﻿name: ci-cd
+
+on:
+  push:
+    branches: [ dev, test, main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # Branch → environment: main→prod, dev→dev, test→test
+    environment:
+      name: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+
+    env:
+      IMAGE_NAME: cicdlearn
+      ENVNAME: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set common env from repo/env secrets
+        run: |
+          echo "AZ_RG=${{ secrets.AZURE_RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CAE=${{ secrets.CONTAINERAPPS_ENVIRONMENT }}" >> $GITHUB_ENV
+          echo "KV=${{ secrets.KEYVAULT_NAME }}" >> $GITHUB_ENV
+          echo "SUB=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "TENANT=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ACR=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
+
+      - name: Ensure subscription
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -e
+            az account set --subscription "$SUB"
+            echo "Using subscription: $(az account show --query id -o tsv)"
+
+      # ------- NEW: make sure the runner SP can read secrets from the vault -------
+      - name: Ensure Key Vault access for Service Principal
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -e
+            echo "KV name: $KV (env: $ENVNAME)"
+            # Current runner SP (from AZURE_CREDENTIALS)
+            SP_CLIENT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.clientId')
+            SP_OBJECT_ID=$(az ad sp show --id "$SP_CLIENT_ID" --query id -o tsv)
+            echo "Runner SP clientId: $SP_CLIENT_ID"
+            echo "Runner SP objectId : $SP_OBJECT_ID"
+
+            # Figure out KV permission model
+            RBAC_ENABLED=$(az keyvault show -n "$KV" --query "properties.enableRbacAuthorization" -o tsv)
+            KV_ID=$(az keyvault show -n "$KV" --query id -o tsv)
+            echo "Key Vault RBAC enabled: $RBAC_ENABLED"
+            echo "Key Vault id: $KV_ID"
+
+            if [ "$RBAC_ENABLED" = "true" ]; then
+              echo "Vault uses RBAC. Checking 'Key Vault Secrets User' assignment..."
+              HAVE_ASSIGN=$(az role assignment list \
+                --assignee-object-id "$SP_OBJECT_ID" \
+                --scope "$KV_ID" \
+                --query "[?roleDefinitionName=='Key Vault Secrets User'] | length(@)" -o tsv)
+
+              if [ "$HAVE_ASSIGN" != "1" ]; then
+                echo "No 'Key Vault Secrets User' found on $KV for the runner SP."
+
+                # Try to create it (works only if the SP has permission to assign roles at this scope)
+                set +e
+                az role assignment create \
+                  --assignee-object-id "$SP_OBJECT_ID" \
+                  --assignee-principal-type ServicePrincipal \
+                  --role "Key Vault Secrets User" \
+                  --scope "$KV_ID"
+                CREATE_RC=$?
+                set -e
+
+                if [ $CREATE_RC -ne 0 ]; then
+                  echo "::warning::Could not create RBAC assignment automatically."
+                  echo "::warning::Please grant the runner SP (clientId $SP_CLIENT_ID) the 'Key Vault Secrets User' role on scope:"
+                  echo "::warning::$KV_ID"
+                  echo "::warning::Then re-run the workflow."
+                else
+                  echo "RBAC assignment created."
+                fi
+              else
+                echo "Runner SP already has 'Key Vault Secrets User' on the vault."
+              fi
+
+            else
+              echo "Vault uses Access Policies. Ensuring secrets GET/LIST policy for the runner SP..."
+              az keyvault set-policy \
+                -n "$KV" \
+                --spn "$SP_CLIENT_ID" \
+                --secret-permissions get list
+              echo "Access policy ensured."
+            fi
+
+      # ---------------------------------------------------------------------------
+
+      - name: Docker login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR }}.azurecr.io
+          username: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+          password: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientSecret }}
+
+      - name: Set image tag
+        id: tag
+        run: echo "TAG=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}
+
+      #- name: Read OPENAI key from Key Vault
+      #  uses: azure/cli@v2
+      #  with:
+      #    inlineScript: |
+      #      set -e
+      #      echo "Reading OPENAI-API-KEY from $KV ..."
+      #      key=$(az keyvault secret show --vault-name "$KV" --name "OPENAI-API-KEY" --query value -o tsv 2>/tmp/kv.err || true)
+      #      if [ -z "$key" ]; then
+      #        echo "::error::Failed to read OPENAI-API-KEY from $KV"
+      #        echo "Diagnostic:"
+      #        cat /tmp/kv.err || true
+      #        echo "Quick fixes:"
+      #        echo "  • Ensure the secret exists: az keyvault secret set --vault-name $KV -n OPENAI-API-KEY --value <value>"
+      #        echo "  • Ensure the runner SP (clientId $(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.clientId')) can read secrets (RBAC: 'Key Vault Secrets User' or Access Policy Get/List)."
+      #        exit 1
+      #      fi
+      #      echo "OPENAI_KEY=$key" >> $GITHUB_ENV
+
+      - name: (Optional) Enable ACR admin & fetch creds for first-time create
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -e
+            az acr update -n "$ACR" --admin-enabled true
+            user=$(az acr credential show -n "$ACR" --query "username" -o tsv)
+            pass=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
+            echo "ACR_USER=$user" >> $GITHUB_ENV
+            echo "ACR_PASS=$pass" >> $GITHUB_ENV
+
+      - name: Create/Update Container App
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -e
+            APPNAME="app-cicdlearn-${{ env.ENVNAME }}"
+            IMG="${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}"
+
+            # Create if missing (pass registry creds only on create)
+            az containerapp create \
+              -g "$AZ_RG" \
+              -n "$APPNAME" \
+              --environment "$CAE" \
+              --image "$IMG" \
+              --ingress external --target-port 8080 \
+              --registry-server "${{ env.ACR }}.azurecr.io" \
+              --registry-username "$ACR_USER" \
+              --registry-password "$ACR_PASS" \
+              --query name -o tsv || true
+
+            # Update image & env
+            az containerapp update \
+              -g "$AZ_RG" \
+              -n "$APPNAME" \
+              --image "$IMG" \
+              --set-env-vars "OPENAI_API_KEY=${{ env.OPENAI_KEY }}" "PORT=8080"
+
+            echo "URL:"
+            az containerapp show -g "$AZ_RG" -n "$APPNAME" --query properties.configuration.ingress.fqdn -o tsv
